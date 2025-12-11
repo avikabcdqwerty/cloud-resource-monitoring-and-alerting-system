@@ -1,0 +1,283 @@
+# tests/__init__.py
+
+# This file marks the tests directory as a Python package.
+
+# No code is required here.
+```
+
+```python
+# tests/conftest.py
+
+import pytest
+from fastapi.testclient import TestClient
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
+from src.main import app
+from src.models import Base, get_engine, get_session
+from src.config import settings
+
+# Use a separate test database (in-memory SQLite for speed)
+TEST_DATABASE_URL = "sqlite+pysqlite:///:memory:"
+
+@pytest.fixture(scope="session")
+def test_engine():
+    engine = create_engine(TEST_DATABASE_URL, connect_args={"check_same_thread": False}, future=True)
+    Base.metadata.create_all(bind=engine)
+    yield engine
+    engine.dispose()
+
+@pytest.fixture(scope="function")
+def db_session(test_engine):
+    connection = test_engine.connect()
+    transaction = connection.begin()
+    SessionLocal = sessionmaker(bind=connection, autoflush=False, autocommit=False, future=True)
+    session = SessionLocal()
+    yield session
+    session.close()
+    transaction.rollback()
+    connection.close()
+
+@pytest.fixture(scope="function")
+def client(monkeypatch, db_session):
+    # Patch get_session to use the test session
+    def override_get_session():
+        yield db_session
+    app.dependency_overrides[get_session] = override_get_session
+    with TestClient(app) as c:
+        yield c
+    app.dependency_overrides.clear()
+```
+
+```python
+# tests/test_products.py
+
+import pytest
+from src.schemas import ProductCreate, ProductUpdate
+
+def test_create_product(client):
+    payload = {"name": "Test Product", "description": "A test product"}
+    response = client.post("/products/", json=payload)
+    assert response.status_code == 201
+    data = response.json()
+    assert data["name"] == payload["name"]
+    assert data["description"] == payload["description"]
+    assert "id" in data
+
+def test_get_products(client):
+    # Create a product first
+    payload = {"name": "Product2", "description": "Another product"}
+    client.post("/products/", json=payload)
+    response = client.get("/products/")
+    assert response.status_code == 200
+    data = response.json()
+    assert isinstance(data, list)
+    assert any(p["name"] == "Product2" for p in data)
+
+def test_get_product_by_id(client):
+    payload = {"name": "Product3", "description": "Third product"}
+    resp = client.post("/products/", json=payload)
+    prod_id = resp.json()["id"]
+    response = client.get(f"/products/{prod_id}")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["id"] == prod_id
+    assert data["name"] == payload["name"]
+
+def test_update_product(client):
+    payload = {"name": "Product4", "description": "Fourth product"}
+    resp = client.post("/products/", json=payload)
+    prod_id = resp.json()["id"]
+    update_payload = {"description": "Updated description"}
+    response = client.put(f"/products/{prod_id}", json=update_payload)
+    assert response.status_code == 200
+    data = response.json()
+    assert data["description"] == "Updated description"
+
+def test_delete_product(client):
+    payload = {"name": "Product5", "description": "Fifth product"}
+    resp = client.post("/products/", json=payload)
+    prod_id = resp.json()["id"]
+    response = client.delete(f"/products/{prod_id}")
+    assert response.status_code == 204
+    # Ensure it's deleted
+    response = client.get(f"/products/{prod_id}")
+    assert response.status_code == 404
+```
+
+```python
+# tests/test_alerting.py
+
+import pytest
+from src.models import AlertSeverity, AlertStatus
+from src.schemas import ProductCreate
+
+def test_alert_lifecycle(client, db_session):
+    # Create a product and a resource
+    product_payload = {"name": "AlertTestProduct", "description": "For alerting test"}
+    client.post("/products/", json=product_payload)
+    resource_payload = {
+        "resource_id": "test-resource-1",
+        "name": "Test Resource",
+        "type": "vm",
+        "cloud_provider": "aws",
+        "onboarded": True,
+        "monitoring_enabled": True,
+    }
+    # Directly insert resource via DB for simplicity
+    from src.models import Resource, ResourceType
+    resource = Resource(
+        resource_id=resource_payload["resource_id"],
+        name=resource_payload["name"],
+        type=ResourceType.VM,
+        cloud_provider=resource_payload["cloud_provider"],
+        onboarded=True,
+        monitoring_enabled=True,
+    )
+    db_session.add(resource)
+    db_session.commit()
+    db_session.refresh(resource)
+
+    # Simulate alert creation (would normally be triggered by monitoring)
+    from src.alerting import generate_alert
+    alert = generate_alert(
+        db=db_session,
+        resource_id=resource.id,
+        severity=AlertSeverity.CRITICAL,
+        message="CPU usage exceeded threshold",
+        incident_details={"cpu": 99.9},
+    )
+    assert alert.status == AlertStatus.OPEN
+    assert alert.severity == AlertSeverity.CRITICAL
+
+    # Fetch alert via API
+    response = client.get(f"/alerts/{alert.id}")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["id"] == alert.id
+    assert data["status"] == AlertStatus.OPEN
+
+    # Resolve alert via API
+    response = client.post(f"/alerts/{alert.id}/resolve")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == AlertStatus.RESOLVED
+
+def test_get_alerts(client, db_session):
+    # Create a resource and an alert
+    from src.models import Resource, ResourceType
+    resource = Resource(
+        resource_id="test-resource-2",
+        name="Resource2",
+        type=ResourceType.VM,
+        cloud_provider="aws",
+        onboarded=True,
+        monitoring_enabled=True,
+    )
+    db_session.add(resource)
+    db_session.commit()
+    db_session.refresh(resource)
+    from src.alerting import generate_alert
+    alert = generate_alert(
+        db=db_session,
+        resource_id=resource.id,
+        severity=AlertSeverity.WARNING,
+        message="Memory usage high",
+        incident_details={"memory": 85.0},
+    )
+    # Fetch all alerts
+    response = client.get("/alerts/")
+    assert response.status_code == 200
+    data = response.json()
+    assert isinstance(data, list)
+    assert any(a["id"] == alert.id for a in data)
+```
+
+```python
+# tests/test_audit.py
+
+import pytest
+
+def test_audit_log_creation_and_query(client, db_session):
+    # Create a resource and an alert to generate audit logs
+    from src.models import Resource, ResourceType, AlertSeverity
+    from src.alerting import generate_alert, resolve_alert
+    resource = Resource(
+        resource_id="audit-resource-1",
+        name="AuditResource",
+        type=ResourceType.VM,
+        cloud_provider="aws",
+        onboarded=True,
+        monitoring_enabled=True,
+    )
+    db_session.add(resource)
+    db_session.commit()
+    db_session.refresh(resource)
+    alert = generate_alert(
+        db=db_session,
+        resource_id=resource.id,
+        severity=AlertSeverity.CRITICAL,
+        message="Disk full",
+        incident_details={"storage": 100.0},
+    )
+    # Resolve the alert to generate a resolution audit log
+    resolve_alert(db=db_session, alert_id=alert.id)
+    # Fetch audit logs via API
+    response = client.get("/audit/logs/")
+    assert response.status_code == 200
+    data = response.json()
+    assert isinstance(data, list)
+    assert any("event_type" in log for log in data)
+```
+
+```python
+# tests/test_onboarding.py
+
+import pytest
+
+def test_onboarding_triggers_and_idempotency(client, db_session):
+    # Trigger onboarding via API
+    response = client.post("/onboarding/resources/")
+    assert response.status_code == 202
+    # Trigger again to ensure idempotency (should not duplicate)
+    response = client.post("/onboarding/resources/")
+    assert response.status_code == 202
+    # Check resources exist in DB
+    from src.models import Resource
+    resources = db_session.query(Resource).all()
+    assert len(resources) >= 1
+    # Resource IDs should be unique
+    resource_ids = [r.resource_id for r in resources]
+    assert len(resource_ids) == len(set(resource_ids))
+```
+
+```python
+# tests/test_monitoring.py
+
+import pytest
+
+def test_metrics_endpoints(client, db_session):
+    # Add a resource
+    from src.models import Resource, ResourceType
+    resource = Resource(
+        resource_id="metrics-resource-1",
+        name="MetricsResource",
+        type=ResourceType.VM,
+        cloud_provider="aws",
+        onboarded=True,
+        monitoring_enabled=True,
+    )
+    db_session.add(resource)
+    db_session.commit()
+    db_session.refresh(resource)
+    # Get metrics for all resources
+    response = client.get("/metrics/resources/")
+    assert response.status_code == 200
+    data = response.json()
+    assert isinstance(data, list)
+    # Get metrics for specific resource
+    response = client.get(f"/metrics/resources/{resource.resource_id}")
+    assert response.status_code == 200
+    data = response.json()
+    assert "resource_id" in data
+    assert "metrics" in data
