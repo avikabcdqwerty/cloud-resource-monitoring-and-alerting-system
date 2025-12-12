@@ -5,14 +5,7 @@ from datetime import datetime
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import SQLAlchemyError
 
-from .models import Alert, AlertStatus, AlertSeverity, Resource, AuditLog, get_session
-from .schemas import AlertOut, AuditLogCreate
-from .crud import (
-    get_alert,
-    update_alert,
-    get_alerts as crud_get_alerts,
-    create_audit_log,
-)
+
 from .config import settings
 
 # Email and messaging platform integration
